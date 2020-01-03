@@ -65,6 +65,7 @@ deps_scripts/kconfig/conf.o := \
   scripts/kconfig/lkc.h \
     $(wildcard include/config/prefix.h) \
     $(wildcard include/config/list.h) \
+    $(wildcard include/config/y.h) \
   scripts/kconfig/expr.h \
   /usr/include/assert.h \
   scripts/kconfig/list.h \
