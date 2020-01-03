@@ -91,6 +91,7 @@ struct gfs2_rgrpd {
 	struct gfs2_rgrp_lvb *rd_rgl;
 	u32 rd_last_alloc;
 	u32 rd_flags;
+	u32 rd_extfail_pt;		/* extent failure point */
 #define GFS2_RDF_CHECK		0x10000000 /* check for unlinked inodes */
 #define GFS2_RDF_UPTODATE	0x20000000 /* rg is up to date */
 #define GFS2_RDF_ERROR		0x40000000 /* error in rg */
@@ -278,6 +279,20 @@ struct gfs2_blkreserv {
 	unsigned int rs_qa_qd_num;
 };
 
+/*
+ * Allocation parameters
+ * @target: The number of blocks we'd ideally like to allocate
+ * @aflags: The flags (e.g. Orlov flag)
+ *
+ * The intent is to gradually expand this structure over time in
+ * order to give more information, e.g. alignment, min extent size
+ * to the allocation code.
+ */
+struct gfs2_alloc_parms {
+	u32 target;
+	u32 aflags;
+};
+
 enum {
 	GLF_LOCK			= 1,
 	GLF_DEMOTE			= 3,
@@ -340,6 +355,7 @@ enum {
 	GIF_ALLOC_FAILED	= 2,
 	GIF_SW_PAGED		= 3,
 	GIF_ORDERED		= 4,
+	GIF_FREE_VFS_INODE      = 5,
 };
 
 struct gfs2_inode {
@@ -466,6 +482,15 @@ struct gfs2_jdesc {
 	unsigned int jd_jid;
 	unsigned int jd_blocks;
 	int jd_recover_error;
+	/* Replay stuff */
+
+	unsigned int jd_found_blocks;
+	unsigned int jd_found_revokes;
+	unsigned int jd_replayed_blocks;
+
+	struct list_head jd_revoke_list;
+	unsigned int jd_replay_tail;
+
 };
 
 struct gfs2_statfs_change_host {
@@ -749,15 +774,6 @@ struct gfs2_sbd {
 	spinlock_t sd_ail_lock;
 	struct list_head sd_ail1_list;
 	struct list_head sd_ail2_list;
-
-	/* Replay stuff */
-
-	struct list_head sd_revoke_list;
-	unsigned int sd_replay_tail;
-
-	unsigned int sd_found_blocks;
-	unsigned int sd_found_revokes;
-	unsigned int sd_replayed_blocks;
 
 	/* For quiescing the filesystem */
 	struct gfs2_holder sd_freeze_gh;
