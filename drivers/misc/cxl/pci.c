@@ -22,6 +22,7 @@
 #include <asm/pci-bridge.h> /* for struct pci_controller */
 #include <asm/pnv-pci.h>
 #include <asm/io.h>
+#include <asm/reg.h>
 
 #include "cxl.h"
 
@@ -328,12 +329,43 @@ static void dump_afu_descriptor(struct cxl_afu *afu)
 #undef show_reg
 }
 
+#define CAPP_UNIT0_ID 0xBA
+#define CAPP_UNIT1_ID 0XBE
+
+static u64 get_capp_unit_id(struct device_node *np)
+{
+	u32 phb_index;
+
+	/*
+	 * For chips other than POWER8NVL, we only have CAPP 0,
+	 * irrespective of which PHB is used.
+	 */
+	if (!pvr_version_is(PVR_POWER8NVL))
+		return CAPP_UNIT0_ID;
+
+	/*
+	 * For POWER8NVL, assume CAPP 0 is attached to PHB0 and
+	 * CAPP 1 is attached to PHB1.
+	 */
+	if (of_property_read_u32(np, "ibm,phb-index", &phb_index))
+		return 0;
+
+	if (phb_index == 0)
+		return CAPP_UNIT0_ID;
+
+	if (phb_index == 1)
+		return CAPP_UNIT1_ID;
+
+	return 0;
+}
+
 static int init_implementation_adapter_regs(struct cxl *adapter, struct pci_dev *dev)
 {
 	struct device_node *np;
 	const __be32 *prop;
 	u64 psl_dsnctl;
 	u64 chipid;
+	u64 capp_unit_id;
 
 	if (!(np = pnv_pci_get_phb_node(dev)))
 		return -ENODEV;
@@ -343,10 +375,19 @@ static int init_implementation_adapter_regs(struct cxl *adapter, struct pci_dev 
 	if (!np)
 		return -ENODEV;
 	chipid = be32_to_cpup(prop);
+	capp_unit_id = get_capp_unit_id(np);
 	of_node_put(np);
+	if (!capp_unit_id) {
+		pr_err("cxl: invalid capp unit id\n");
+		return -ENODEV;
+	}
 
+	psl_dsnctl = 0x0000900000000000ULL; /* pteupd ttype, scdone */
+	psl_dsnctl |= (0x2ULL << (63-38)); /* MMIO hang pulse: 256 us */
 	/* Tell PSL where to route data to */
-	psl_dsnctl = 0x02E8900002000000ULL | (chipid << (63-5));
+	psl_dsnctl |= (chipid << (63-5));
+	psl_dsnctl |= (capp_unit_id << (63-13));
+
 	cxl_p1_write(adapter, CXL_PSL_DSNDCTL, psl_dsnctl);
 	cxl_p1_write(adapter, CXL_PSL_RESLCKTO, 0x20000000200ULL);
 	/* snoop write mask */
@@ -593,6 +634,22 @@ static int cxl_read_afu_descriptor(struct cxl_afu *afu)
 	afu->crs_len = AFUD_CR_LEN(val) * 256;
 	afu->crs_offset = AFUD_READ_CR_OFF(afu);
 
+
+	/* eb_len is in multiple of 4K */
+	afu->eb_len = AFUD_EB_LEN(AFUD_READ_EB(afu)) * 4096;
+	afu->eb_offset = AFUD_READ_EB_OFF(afu);
+
+	/* eb_off is 4K aligned so lower 12 bits are always zero */
+	if (EXTRACT_PPC_BITS(afu->eb_offset, 0, 11) != 0) {
+		dev_warn(&afu->dev,
+			 "Invalid AFU error buffer offset %Lx\n",
+			 afu->eb_offset);
+		dev_info(&afu->dev,
+			 "Ignoring AFU error buffer in the descriptor\n");
+		/* indicate that no afu buffer exists */
+		afu->eb_len = 0;
+	}
+
 	return 0;
 }
 
@@ -670,6 +727,50 @@ static int sanitise_afu_regs(struct cxl_afu *afu)
 	}
 
 	return 0;
+}
+
+#define ERR_BUFF_MAX_COPY_SIZE PAGE_SIZE
+/*
+ * afu_eb_read:
+ * Called from sysfs and reads the afu error info buffer. The h/w only supports
+ * 4/8 bytes aligned access. So in case the requested offset/count arent 8 byte
+ * aligned the function uses a bounce buffer which can be max PAGE_SIZE.
+ */
+ssize_t cxl_afu_read_err_buffer(struct cxl_afu *afu, char *buf,
+				loff_t off, size_t count)
+{
+	loff_t aligned_start, aligned_end;
+	size_t aligned_length;
+	void *tbuf;
+	const void __iomem *ebuf = afu->afu_desc_mmio + afu->eb_offset;
+
+	if (count == 0 || off < 0 || (size_t)off >= afu->eb_len)
+		return 0;
+
+	/* calculate aligned read window */
+	count = min((size_t)(afu->eb_len - off), count);
+	aligned_start = round_down(off, 8);
+	aligned_end = round_up(off + count, 8);
+	aligned_length = aligned_end - aligned_start;
+
+	/* max we can copy in one read is PAGE_SIZE */
+	if (aligned_length > ERR_BUFF_MAX_COPY_SIZE) {
+		aligned_length = ERR_BUFF_MAX_COPY_SIZE;
+		count = ERR_BUFF_MAX_COPY_SIZE - (off & 0x7);
+	}
+
+	/* use bounce buffer for copy */
+	tbuf = (void *)__get_free_page(GFP_TEMPORARY);
+	if (!tbuf)
+		return -ENOMEM;
+
+	/* perform aligned read from the mmio region */
+	memcpy_fromio(tbuf, ebuf + aligned_start, aligned_length);
+	memcpy(buf, tbuf + (off & 0x7), count);
+
+	free_page((unsigned long)tbuf);
+
+	return count;
 }
 
 static int cxl_init_afu(struct cxl *adapter, int slice, struct pci_dev *dev)

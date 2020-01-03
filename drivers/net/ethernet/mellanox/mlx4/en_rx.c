@@ -703,7 +703,7 @@ static int get_fixed_ipv6_csum(__wsum hw_checksum, struct sk_buff *skb,
 
 	if (ipv6h->nexthdr == IPPROTO_FRAGMENT || ipv6h->nexthdr == IPPROTO_HOPOPTS)
 		return -1;
-	hw_checksum = csum_add(hw_checksum, (__force __wsum)(ipv6h->nexthdr << 8));
+	hw_checksum = csum_add(hw_checksum, (__force __wsum)htons(ipv6h->nexthdr));
 
 	csum_pseudo_hdr = csum_partial(&ipv6h->saddr,
 				       sizeof(ipv6h->saddr) + sizeof(ipv6h->daddr), 0);
@@ -1030,6 +1030,10 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 	mlx4_en_cq_unlock_napi(cq);
 
 	/* If we used up all the quota - we're probably not done yet... */
+#ifndef CONFIG_GENERIC_HARDIRQS
+	cq->tot_rx += done;
+#endif
+
 	if (done == budget) {
 #ifdef CONFIG_GENERIC_HARDIRQS
 		int cpu_curr;
@@ -1050,6 +1054,14 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 		 * poll, and restart it on the right CPU
 		 */
 		done = 0;
+#else
+		if (cq->tot_rx < MLX4_EN_MIN_RX_ARM)
+			return budget;
+
+		cq->tot_rx = 0;
+		done = 0;
+	} else {
+		cq->tot_rx = 0;
 #endif
 	}
 	/* Done for now */
